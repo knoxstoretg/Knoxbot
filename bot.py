@@ -50,22 +50,25 @@ DEMO_ORDERS = 842
 DEMO_SALES = 21500
 DEMO_STOCK = 340
 
+# ------------------------------------------------------------
+# Product IDs used in callback_data: buy_product_1 / _2 / _3
+# ------------------------------------------------------------
 PRODUCTS = {
-    "p1": {
+    "1": {
         "name": "Meesho JSON ₹120 off",
         "price": 20,
         "emoji": "📦",
         "display_value": "₹120",
         "note": "",
     },
-    "p2": {
+    "2": {
         "name": "Meesho JSON ₹205 off",
         "price": 27,
         "emoji": "📦",
         "display_value": "₹205",
         "note": "",
     },
-    "p3": {
+    "3": {
         "name": "Meesho Fresh Number",
         "price": 15,
         "emoji": "🌿",
@@ -104,6 +107,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 def db_init() -> None:
+    """Create tables if missing. Never drops or resets data."""
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -381,15 +385,24 @@ def get_all_users(limit: int = 50):
 
 # --------------------- Orders ------------------------------
 
+def _unique_order_id(conn) -> str | None:
+    """Generate a unique order id, checked against the DB."""
+    for _ in range(15):
+        candidate = "ORD-" + "".join(
+            random.choices(string.ascii_uppercase + string.digits, k=6)
+        )
+        exists = conn.execute(
+            "SELECT 1 FROM orders WHERE order_id=?", (candidate,)
+        ).fetchone()
+        if not exists:
+            return candidate
+    return None
+
+
 def do_purchase(user_id: int, product_id: str):
     """
-    Atomic purchase:
-      - check balance
-      - check stock
-      - deduct balance
-      - reserve one inventory item
-      - create order with unique order_id
-    Returns (status, payload)
+    Atomic purchase. Returns (status, payload).
+    status in: ok | insufficient | out_of_stock | invalid | error
     """
     if product_id not in PRODUCTS:
         return "invalid", None
@@ -421,17 +434,7 @@ def do_purchase(user_id: int, product_id: str):
             conn.rollback()
             return "out_of_stock", None
 
-        oid = None
-        for _ in range(10):
-            candidate = "ORD-" + "".join(
-                random.choices(string.ascii_uppercase + string.digits, k=6)
-            )
-            exists = conn.execute(
-                "SELECT 1 FROM orders WHERE order_id=?", (candidate,)
-            ).fetchone()
-            if not exists:
-                oid = candidate
-                break
+        oid = _unique_order_id(conn)
         if oid is None:
             conn.rollback()
             return "error", None
@@ -487,6 +490,14 @@ def add_inventory_items(product_id: str, items: list) -> int:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def display_username(user) -> str:
+    """Return @username or 'Not set' if absent."""
+    uname = getattr(user, "username", None)
+    if uname:
+        return "@" + uname
+    return "Not set"
 
 
 async def safe_answer(query, text: str | None = None, show_alert: bool = False):
@@ -610,7 +621,8 @@ def products_kb() -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"🛒 Buy ₹{p['price']}", callback_data=f"buy:{pid}"
+                    f"🛒 Buy ₹{p['price']}",
+                    callback_data=f"buy_product_{pid}",
                 )
             ]
         )
@@ -879,7 +891,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-#                   CALLBACK HANDLERS
+#                   VIEW FUNCTIONS
 # ============================================================
 
 async def show_menu(query, ctx):
@@ -984,35 +996,95 @@ async def create_deposit_flow(query, ctx, amount: int):
     )
 
 
+# ============================================================
+#                    BUY FLOW (FIXED)
+# ============================================================
+
 async def cb_buy(query, pid: str, ctx):
-    """Show order confirmation — no deduction yet."""
+    """
+    Step 1 of purchase: check balance from DB.
+    - If insufficient → show insufficient funds screen.
+    - If sufficient → show confirmation screen (no deduction yet).
+    """
     if pid not in PRODUCTS:
         await safe_answer(query, "❌ Invalid product", True)
         return
 
-    if get_stock(pid) <= 0:
-        await safe_answer(query, "⚠️ OUT OF STOCK", True)
+    p = PRODUCTS[pid]
+    user_id = query.from_user.id
+
+    # Always read the CURRENT balance from SQLite
+    user_row = get_user(user_id)
+    if user_row is None:
+        get_or_create_user(query.from_user)
+        user_row = get_user(user_id)
+
+    balance = user_row["balance"] if user_row else 0
+    price = p["price"]
+
+    # Check stock as well so we don't waste the user's time
+    stock = get_stock(pid)
+    if stock <= 0:
+        text = (
+            "⚠️ <b>OUT OF STOCK</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 Product: <b>{html.escape(p['name'])}</b>\n\n"
+            "This product is currently unavailable.\n"
+            "Please check back later."
+        )
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back to Products", callback_data="browse")]]
+        )
+        await safe_edit(query, ctx, text, kb)
         return
 
-    p = PRODUCTS[pid]
-    user_row = get_user(query.from_user.id)
-    balance = user_row["balance"]
-    after = balance - p["price"]
+    # ---- Insufficient funds ----
+    if balance < price:
+        short = price - balance
+        text = (
+            "❌ <b>INSUFFICIENT FUNDS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 Product: <b>{html.escape(p['name'])}</b>\n"
+            f"💰 Price: <b>₹{price}</b>\n\n"
+            f"💳 Your Balance: <b>₹{balance}</b>\n"
+            f"⚠️ Required: <b>₹{price}</b>\n\n"
+            f"You need <b>₹{short}</b> more to place this order.\n\n"
+            "💎 Please add funds to your wallet and try again."
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("💎 Add Funds", callback_data="addfunds")],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back to Products", callback_data="browse"
+                    )
+                ],
+            ]
+        )
+        await safe_edit(query, ctx, text, kb)
+        return
+
+    # ---- Confirmation page ----
+    first_name = html.escape(user_row["first_name"] or "User")
+    balance_after = balance - price
+    uname_display = display_username(query.from_user)
 
     text = (
         "🛍️ <b>ORDER CONFIRMATION</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"📦 Product:\n<b>{html.escape(p['name'])}</b>\n\n"
-        f"💰 Price: ₹<b>{p['price']}</b>\n"
-        f"💳 Wallet Balance: ₹<b>{balance}</b>\n\n"
-        f"💵 Balance After Purchase: ₹<b>{after if after >= 0 else 0}</b>\n\n"
-        "Please confirm your purchase."
+        f"📦 <b>Product</b>\n{html.escape(p['name'])}\n\n"
+        f"💰 <b>Price:</b> ₹{price}\n"
+        f"💳 <b>Wallet Balance:</b> ₹{balance}\n\n"
+        f"💵 <b>Balance After Purchase:</b> ₹{balance_after}\n\n"
+        f"👤 <b>User:</b> {first_name}\n"
+        f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
+        "Please confirm your purchase below."
     )
     kb = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ Confirm Purchase", callback_data=f"confirm:{pid}"
+                    "✅ Confirm Purchase", callback_data=f"confirm_buy_{pid}"
                 )
             ],
             [InlineKeyboardButton("❌ Cancel", callback_data="browse")],
@@ -1021,8 +1093,10 @@ async def cb_buy(query, pid: str, ctx):
     await safe_edit(query, ctx, text, kb)
 
 
-async def cb_confirm(query, pid: str, ctx):
-    """Execute purchase atomically after re-checking balance & stock."""
+async def cb_confirm_buy(query, pid: str, ctx):
+    """
+    Step 2 of purchase: perform the atomic purchase.
+    """
     if pid not in PRODUCTS:
         await safe_answer(query, "❌ Invalid product", True)
         return
@@ -1032,56 +1106,73 @@ async def cb_confirm(query, pid: str, ctx):
 
     status, payload = do_purchase(user_id, pid)
 
+    # ---- Insufficient (race: balance changed between screens) ----
     if status == "insufficient":
         user_row = get_user(user_id)
         balance = user_row["balance"] if user_row else 0
-        short = p["price"] - balance
+        short = p["price"] - balance if p["price"] > balance else 0
         text = (
-            "❌ <b>INSUFFICIENT BALANCE</b>\n"
+            "❌ <b>INSUFFICIENT FUNDS</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"This product costs ₹<b>{p['price']}</b>.\n\n"
-            f"💳 Your Balance: ₹<b>{balance}</b>\n"
-            f"💰 Required: ₹<b>{p['price']}</b>\n"
-            f"📉 Short by: ₹<b>{short}</b>\n\n"
-            "Please add funds and try again."
+            f"📦 Product: <b>{html.escape(p['name'])}</b>\n"
+            f"💰 Price: <b>₹{p['price']}</b>\n\n"
+            f"💳 Your Balance: <b>₹{balance}</b>\n"
+            f"⚠️ Required: <b>₹{p['price']}</b>\n\n"
+            f"You need <b>₹{short}</b> more to place this order.\n\n"
+            "💎 Please add funds to your wallet and try again."
         )
         kb = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("💎 Add Funds", callback_data="addfunds")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="browse")],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back to Products", callback_data="browse"
+                    )
+                ],
             ]
         )
         await safe_edit(query, ctx, text, kb)
         return
 
+    # ---- Out of stock (race) ----
     if status == "out_of_stock":
         text = (
             "⚠️ <b>OUT OF STOCK</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            "This product is currently unavailable."
+            f"📦 Product: <b>{html.escape(p['name'])}</b>\n\n"
+            "This product is currently unavailable.\n"
+            "Please check back later."
         )
         kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Back", callback_data="browse")]]
+            [[InlineKeyboardButton("⬅️ Back to Products", callback_data="browse")]]
         )
         await safe_edit(query, ctx, text, kb)
         return
 
+    # ---- Unexpected error ----
     if status != "ok" or payload is None:
         await safe_answer(query, "⚠️ Something went wrong. Try again.", True)
         return
 
+    # ---- Success ----
     handle = SUPPORT_USERNAME[1:] if SUPPORT_USERNAME.startswith("@") else SUPPORT_USERNAME
+    uname_display = display_username(query.from_user)
+
     text = (
-        "✅ <b>ORDER CONFIRMED</b>\n"
+        "✅ <b>ORDER PLACED SUCCESSFULLY</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🎉 Your order has been successfully created!\n\n"
-        f"📦 Product: <b>{html.escape(payload['product_name'])}</b>\n"
-        f"💰 Amount Paid: ₹<b>{payload['price']}</b>\n\n"
-        f"🧾 Order ID: <code>{payload['order_id']}</code>\n\n"
-        f"💳 Remaining Balance: ₹<b>{payload['new_balance']}</b>\n\n"
-        "📩 For delivery/support, contact:\n"
+        "🎉 Thank you for your purchase!\n\n"
+        f"📦 <b>Product:</b>\n{html.escape(payload['product_name'])}\n\n"
+        f"💰 <b>Price Paid:</b> ₹{payload['price']}\n\n"
+        f"🧾 <b>Order ID:</b>\n<code>{payload['order_id']}</code>\n\n"
+        f"👤 <b>User:</b> {html.escape(uname_display)}\n"
+        f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
+        f"💳 <b>Remaining Balance:</b> ₹{payload['new_balance']}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎧 <b>Need Help?</b>\n\n"
+        "For order-related support, contact:\n\n"
         f"<b>{html.escape(SUPPORT_USERNAME)}</b>\n\n"
-        "Please send your Order ID to support.\n\n"
+        "Please provide your Order ID when contacting support.\n\n"
         "📦 <b>Your Item:</b>\n"
         f"<code>{html.escape(payload['item'])}</code>"
     )
@@ -1337,13 +1428,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             await safe_edit(query, ctx, text, kb)
 
+        # ---- Buy flow ----
+        elif data.startswith("buy_product_"):
+            await safe_answer(query)
+            pid = data[len("buy_product_"):]
+            await cb_buy(query, pid, ctx)
+
+        elif data.startswith("confirm_buy_"):
+            await safe_answer(query)
+            pid = data[len("confirm_buy_"):]
+            await cb_confirm_buy(query, pid, ctx)
+
+        # ---- Legacy support (in case old messages still exist) ----
         elif data.startswith("buy:"):
             await safe_answer(query)
             await cb_buy(query, data.split(":", 1)[1], ctx)
 
         elif data.startswith("confirm:"):
             await safe_answer(query)
-            await cb_confirm(query, data.split(":", 1)[1], ctx)
+            await cb_confirm_buy(query, data.split(":", 1)[1], ctx)
 
         elif data == "stats":
             await safe_answer(query)
