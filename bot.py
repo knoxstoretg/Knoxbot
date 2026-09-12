@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatMemberStatus
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,13 +25,12 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 
-# Comma separated admin IDs in env, or hardcode here.
 _env_admins = os.environ.get("ADMIN_IDS", "").replace(" ", "")
 ADMIN_IDS = [
     int(x)
     for x in _env_admins.split(",")
     if x.strip().lstrip("-").isdigit()
-] or [123456789]  # fallback example — replace with your real admin ID
+] or [123456789]  # replace with your real admin ID
 
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@yourusername")
 
@@ -46,16 +45,11 @@ STOCK_REFRESH_MINUTES = 5
 STOCK_CACHE_TTL = STOCK_REFRESH_MINUTES * 60
 
 DEMO_STATS = False
-
-# Demo values (used only when DEMO_STATS = True)
 DEMO_USERS = 1250
 DEMO_ORDERS = 842
 DEMO_SALES = 21500
 DEMO_STOCK = 340
 
-# ------------------------------------------------------------
-# PRODUCTS  (edit here — no other place hard-codes products)
-# ------------------------------------------------------------
 PRODUCTS = {
     "p1": {
         "name": "Meesho JSON ₹120 off",
@@ -80,7 +74,6 @@ PRODUCTS = {
     },
 }
 
-# Paths (Linux compatible, relative to bot.py)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 QR_PATH = os.path.join(BASE_DIR, "qr.png")
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "store.db"))
@@ -222,8 +215,6 @@ def _real_total_stock() -> int:
         conn.close()
 
 
-# ------- Live stock cache (smoothing / refresh) ------------
-
 _stock_cache = {
     "value": 0,
     "ts": 0.0,
@@ -231,10 +222,6 @@ _stock_cache = {
 
 
 def get_display_stock() -> int:
-    """
-    Returns the stock to display.
-    Never greater than real stock. Refreshes at most every STOCK_CACHE_TTL.
-    """
     real = _real_total_stock()
     now_ts = time.time()
 
@@ -242,7 +229,6 @@ def get_display_stock() -> int:
         _stock_cache["value"] = real
         _stock_cache["ts"] = now_ts
     else:
-        # If real dropped below cached, immediately use real (never overstate).
         if real < _stock_cache["value"]:
             _stock_cache["value"] = real
             _stock_cache["ts"] = now_ts
@@ -395,21 +381,6 @@ def get_all_users(limit: int = 50):
 
 # --------------------- Orders ------------------------------
 
-def generate_order_id() -> str:
-    """Generate a unique ORD-XXXXXX order ID."""
-    conn = get_conn()
-    try:
-        while True:
-            oid = "ORD-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-            exists = conn.execute(
-                "SELECT 1 FROM orders WHERE order_id=?", (oid,)
-            ).fetchone()
-            if not exists:
-                return oid
-    finally:
-        conn.close()
-
-
 def do_purchase(user_id: int, product_id: str):
     """
     Atomic purchase:
@@ -419,8 +390,6 @@ def do_purchase(user_id: int, product_id: str):
       - reserve one inventory item
       - create order with unique order_id
     Returns (status, payload)
-      status in: ok | insufficient | out_of_stock | invalid | error
-      payload for ok = dict(order_id, item, new_balance, price, product_name)
     """
     if product_id not in PRODUCTS:
         return "invalid", None
@@ -452,7 +421,6 @@ def do_purchase(user_id: int, product_id: str):
             conn.rollback()
             return "out_of_stock", None
 
-        # generate order id inside transaction (checking uniqueness)
         oid = None
         for _ in range(10):
             candidate = "ORD-" + "".join(
@@ -529,7 +497,6 @@ async def safe_answer(query, text: str | None = None, show_alert: bool = False):
 
 
 async def safe_edit(query, ctx, text: str, kb):
-    """Edit current message; fall back to delete+send if editing fails."""
     chat_id = query.message.chat_id
     try:
         await query.edit_message_text(
@@ -558,7 +525,6 @@ async def safe_edit(query, ctx, text: str, kb):
 # ------------------------ Force Join ------------------------
 
 async def is_member(ctx, user_id: int) -> bool:
-    """Return True if user is a member of the force-join channel."""
     if not FORCE_JOIN_ENABLED:
         return True
     try:
@@ -571,7 +537,6 @@ async def is_member(ctx, user_id: int) -> bool:
         return True
     except BadRequest as e:
         logger.warning("Force-join check failed (BadRequest): %s", e)
-        # Can't verify → let them through to avoid lockout; admin should fix config
         return True
     except Exception as e:
         logger.warning("Force-join check failed: %s", e)
@@ -718,12 +683,9 @@ def stats_text() -> str:
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Reset any in-progress state so /start always returns to home
     ctx.user_data.clear()
-
     get_or_create_user(user)
 
-    # Force-join gate
     if FORCE_JOIN_ENABLED:
         member = await is_member(ctx, user.id)
         if not member:
@@ -838,7 +800,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = msg.text.strip()
 
-    # ---- Admin adding inventory ----
     if is_admin(user.id) and ctx.user_data.get("admin_stock"):
         pid = ctx.user_data["admin_stock"]
         if pid not in PRODUCTS:
@@ -863,7 +824,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---- Custom deposit amount ----
     if ctx.user_data.get("awaiting_amount"):
         try:
             amount = int(text)
@@ -1025,7 +985,7 @@ async def create_deposit_flow(query, ctx, amount: int):
 
 
 async def cb_buy(query, pid: str, ctx):
-    """Show order confirmation (no deduction yet)."""
+    """Show order confirmation — no deduction yet."""
     if pid not in PRODUCTS:
         await safe_answer(query, "❌ Invalid product", True)
         return
@@ -1070,4 +1030,415 @@ async def cb_confirm(query, pid: str, ctx):
     p = PRODUCTS[pid]
     user_id = query.from_user.id
 
-    status, payload =
+    status, payload = do_purchase(user_id, pid)
+
+    if status == "insufficient":
+        user_row = get_user(user_id)
+        balance = user_row["balance"] if user_row else 0
+        short = p["price"] - balance
+        text = (
+            "❌ <b>INSUFFICIENT BALANCE</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"This product costs ₹<b>{p['price']}</b>.\n\n"
+            f"💳 Your Balance: ₹<b>{balance}</b>\n"
+            f"💰 Required: ₹<b>{p['price']}</b>\n"
+            f"📉 Short by: ₹<b>{short}</b>\n\n"
+            "Please add funds and try again."
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("💎 Add Funds", callback_data="addfunds")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="browse")],
+            ]
+        )
+        await safe_edit(query, ctx, text, kb)
+        return
+
+    if status == "out_of_stock":
+        text = (
+            "⚠️ <b>OUT OF STOCK</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "This product is currently unavailable."
+        )
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="browse")]]
+        )
+        await safe_edit(query, ctx, text, kb)
+        return
+
+    if status != "ok" or payload is None:
+        await safe_answer(query, "⚠️ Something went wrong. Try again.", True)
+        return
+
+    handle = SUPPORT_USERNAME[1:] if SUPPORT_USERNAME.startswith("@") else SUPPORT_USERNAME
+    text = (
+        "✅ <b>ORDER CONFIRMED</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🎉 Your order has been successfully created!\n\n"
+        f"📦 Product: <b>{html.escape(payload['product_name'])}</b>\n"
+        f"💰 Amount Paid: ₹<b>{payload['price']}</b>\n\n"
+        f"🧾 Order ID: <code>{payload['order_id']}</code>\n\n"
+        f"💳 Remaining Balance: ₹<b>{payload['new_balance']}</b>\n\n"
+        "📩 For delivery/support, contact:\n"
+        f"<b>{html.escape(SUPPORT_USERNAME)}</b>\n\n"
+        "Please send your Order ID to support.\n\n"
+        "📦 <b>Your Item:</b>\n"
+        f"<code>{html.escape(payload['item'])}</code>"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎧 Contact Support", url=f"https://t.me/{handle}")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="menu")],
+        ]
+    )
+    await safe_edit(query, ctx, text, kb)
+
+
+# ---------------- Admin callbacks ----------------
+
+async def admin_deposits_view(query, ctx):
+    deps = get_pending_deposits()
+    if not deps:
+        text = "💰 <b>PENDING DEPOSITS</b>\n\nNo pending deposits."
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="admin:panel")]]
+        )
+        await safe_edit(query, ctx, text, kb)
+        return
+    rows = []
+    for d in deps:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{d['deposit_id']} • ₹{d['amount']}",
+                    callback_data=f"admin:dep:{d['deposit_id']}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:panel")])
+    text = f"💰 <b>PENDING DEPOSITS</b> ({len(deps)})\n\nSelect one to review:"
+    await safe_edit(query, ctx, text, InlineKeyboardMarkup(rows))
+
+
+async def admin_deposit_view_one(query, ctx, dep_id: str):
+    d = get_deposit(dep_id)
+    if not d:
+        await safe_answer(query, "Not found", True)
+        return
+    if d["status"] != "pending":
+        await safe_answer(query, f"Already {d['status']}", True)
+        return
+
+    u = get_user(d["user_id"])
+    uname = html.escape((u["first_name"] if u else "") or "")
+    caption = (
+        "💰 <b>DEPOSIT REVIEW</b>\n\n"
+        f"Order ID: <code>{d['deposit_id']}</code>\n"
+        f"User: {uname} (<code>{d['user_id']}</code>)\n"
+        f"Amount: ₹<b>{d['amount']}</b>\n"
+        f"Created: {d['created_at']}"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Approve", callback_data=f"admin:appr:{dep_id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Reject", callback_data=f"admin:rej:{dep_id}"
+                ),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:deposits")],
+        ]
+    )
+
+    if d["screenshot"]:
+        try:
+            await ctx.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=d["screenshot"],
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            return
+        except Exception:
+            logger.exception("Failed to send deposit screenshot")
+
+    await safe_edit(query, ctx, caption, kb)
+
+
+async def admin_users_view(query, ctx):
+    users = get_all_users(50)
+    if not users:
+        text = "👥 <b>USERS</b>\n\nNo users yet."
+    else:
+        lines = [f"👥 <b>USERS</b> (latest {len(users)})\n"]
+        for u in users:
+            uname = u["username"] and f"@{u['username']}" or "—"
+            lines.append(
+                f"• <code>{u['user_id']}</code> — "
+                f"{html.escape(u['first_name'] or '')} ({html.escape(uname)}) "
+                f"— ₹{u['balance']}"
+            )
+        text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Back", callback_data="admin:panel")]]
+    )
+    await safe_edit(query, ctx, text, kb)
+
+
+async def handle_admin_callback(query, ctx, data: str):
+    if not is_admin(query.from_user.id):
+        await safe_answer(query, "❌ Access denied", True)
+        return
+
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "panel":
+        await safe_edit(query, ctx, "🔐 <b>ADMIN PANEL</b>", admin_panel_kb())
+
+    elif action == "addstock":
+        text, kb = addstock_content()
+        await safe_edit(query, ctx, text, kb)
+
+    elif action == "stock":
+        pid = parts[2] if len(parts) > 2 else ""
+        if pid not in PRODUCTS:
+            await safe_answer(query, "❌ Invalid product", True)
+            return
+        ctx.user_data["admin_stock"] = pid
+        p = PRODUCTS[pid]
+        text = (
+            "📦 <b>ADD STOCK</b>\n\n"
+            f"Product: <b>{html.escape(p['name'])}</b> (₹{p['price']})\n\n"
+            "Send inventory items now.\n"
+            "• One item per line\n"
+            "• Send multiple messages to add more\n"
+            "• Send /cancel when done"
+        )
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Done", callback_data="admin:panel")]]
+        )
+        await safe_edit(query, ctx, text, kb)
+
+    elif action == "stats":
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="admin:panel")]]
+        )
+        await safe_edit(query, ctx, stats_text(), kb)
+
+    elif action == "deposits":
+        await admin_deposits_view(query, ctx)
+
+    elif action == "dep":
+        dep_id = parts[2] if len(parts) > 2 else ""
+        await admin_deposit_view_one(query, ctx, dep_id)
+
+    elif action in ("appr", "rej"):
+        dep_id = parts[2] if len(parts) > 2 else ""
+        if action == "appr":
+            ok, d = approve_deposit(dep_id)
+            if not ok:
+                await safe_answer(query, "Already processed", True)
+                return
+            try:
+                await ctx.bot.send_message(
+                    chat_id=d["user_id"],
+                    text=(
+                        "✅ <b>Deposit Approved</b>\n\n"
+                        f"₹{d['amount']} has been added to your wallet.\n"
+                        f"Order ID: <code>{d['deposit_id']}</code>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            await safe_answer(query, "✅ Approved", True)
+        else:
+            ok, d = reject_deposit(dep_id)
+            if not ok:
+                await safe_answer(query, "Already processed", True)
+                return
+            try:
+                await ctx.bot.send_message(
+                    chat_id=d["user_id"],
+                    text=(
+                        "❌ <b>Deposit Rejected</b>\n\n"
+                        f"Order ID: <code>{d['deposit_id']}</code>\n"
+                        f"Amount: ₹{d['amount']}\n\n"
+                        "Please contact support if you believe this is a mistake."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            await safe_answer(query, "❌ Rejected", True)
+
+        await admin_deposits_view(query, ctx)
+
+    elif action == "users":
+        await admin_users_view(query, ctx)
+
+    else:
+        await safe_answer(query, "❌ Invalid callback", True)
+
+
+# ---------------- Main callback router ----------------
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+
+    data = query.data or ""
+
+    try:
+        if data == "menu":
+            await safe_answer(query)
+            await show_menu(query, ctx)
+
+        elif data == "browse":
+            await safe_answer(query)
+            await show_products(query, ctx)
+
+        elif data == "addfunds":
+            await safe_answer(query)
+            await show_addfunds(query, ctx)
+
+        elif data.startswith("amt:"):
+            await safe_answer(query)
+            try:
+                amount = int(data.split(":", 1)[1])
+            except (ValueError, IndexError):
+                await safe_answer(query, "❌ Invalid amount", True)
+                return
+            if amount < MIN_DEPOSIT:
+                await safe_answer(
+                    query, f"❌ Minimum deposit is ₹{MIN_DEPOSIT}", True
+                )
+                return
+            await create_deposit_flow(query, ctx, amount)
+
+        elif data == "amt_custom":
+            await safe_answer(query)
+            ctx.user_data["awaiting_amount"] = True
+            text = (
+                "✏️ <b>CUSTOM AMOUNT</b>\n\n"
+                f"Send the amount you want to deposit (minimum ₹{MIN_DEPOSIT})."
+            )
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Cancel", callback_data="addfunds")]]
+            )
+            await safe_edit(query, ctx, text, kb)
+
+        elif data.startswith("buy:"):
+            await safe_answer(query)
+            await cb_buy(query, data.split(":", 1)[1], ctx)
+
+        elif data.startswith("confirm:"):
+            await safe_answer(query)
+            await cb_confirm(query, data.split(":", 1)[1], ctx)
+
+        elif data == "stats":
+            await safe_answer(query)
+            await show_stats(query, ctx)
+
+        elif data == "support":
+            await safe_answer(query)
+            await show_support(query, ctx)
+
+        elif data == "cancel_dep":
+            await safe_answer(query)
+            ctx.user_data.pop("pending_deposit", None)
+            ctx.user_data.pop("awaiting_amount", None)
+            await show_menu(query, ctx)
+
+        elif data == "check_join":
+            await safe_answer(query)
+            user_id = query.from_user.id
+            member = await is_member(ctx, user_id)
+            if member:
+                get_or_create_user(query.from_user)
+                await show_menu(query, ctx)
+            else:
+                text = (
+                    "❌ <b>You haven't joined the channel yet.</b>\n\n"
+                    "Please join the channel first."
+                )
+                await safe_edit(query, ctx, text, force_join_kb())
+
+        elif data.startswith("admin:"):
+            await safe_answer(query)
+            await handle_admin_callback(query, ctx, data)
+
+        else:
+            await safe_answer(query, "❌ Invalid callback", True)
+
+    except Exception:
+        logger.exception("Callback handler error")
+        await safe_answer(query, "⚠️ Something went wrong", True)
+
+
+# ============================================================
+#                      ERROR HANDLER
+# ============================================================
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception", exc_info=ctx.error)
+
+
+# ============================================================
+#                         MAIN
+# ============================================================
+
+def main():
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
+        logger.error(
+            "BOT_TOKEN is not configured. "
+            "Set the BOT_TOKEN environment variable before starting."
+        )
+        raise SystemExit(1)
+
+    if not ADMIN_IDS or ADMIN_IDS == [123456789]:
+        logger.warning(
+            "ADMIN_IDS is using the placeholder fallback. "
+            "Set the ADMIN_IDS env var (e.g. ADMIN_IDS=123456789)."
+        )
+
+    db_init()
+    logger.info("Database ready at %s", DB_PATH)
+    logger.info("QR path: %s (exists=%s)", QR_PATH, os.path.exists(QR_PATH))
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("addstock", cmd_addstock))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+    )
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
+
+    app.add_error_handler(on_error)
+
+    logger.info("Bot is starting (long polling)…")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
